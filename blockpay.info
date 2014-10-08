@@ -1,0 +1,14 @@
+name = BlockPay
+description = Provides integration with BlockPay bitcoin payment service.
+core = 7.x
+files[] = blockpay.admin.inc
+files[] = blockpay.pages.inc
+configure = admin/config/services/blockpay
+stylesheets[all][] = blockpay.css
+
+; Information added by Drupal.org packaging script on 2014-04-23
+version = "7.x-1.x-dev"
+core = "7.x"
+project = "blockpay"
+datestamp = "1398290943"
+

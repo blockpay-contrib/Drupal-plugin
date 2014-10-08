@@ -1,0 +1,206 @@
+<?php
+
+/**
+ * Creates a BlockPay invoice.
+ *
+ * Note that $pos_data has an approximately 32-character max length (depending
+ * how many characters are required to serialize the $pos_data variable), and
+ * each field in the $options array has a 100-character max length.
+ */
+function blockpay_create_invoice($order_id, $price, $pos_data, $options = array()) {
+  blockpay_initialize();
+  $invoice = bpCreateInvoice($order_id, $price, $pos_data, $options = array());
+  if ($invoice = blockpay_handle_error($invoice)) {
+    $record['order_id'] = $order_id;
+    $record['created'] = REQUEST_TIME;
+    $record['btc_price'] = $invoice['btcPrice'];
+    $record['status'] = $invoice['status'];
+    blockpay_write_record($record, $invoice['id']);
+  }
+  return $invoice;
+}
+
+/**
+ * Gets a BlockPay invoice.
+ */
+function blockpay_get_invoice($invoice_id) {
+  blockpay_initialize();
+  $invoice = bpGetInvoice($invoice_id);
+  if ($invoice = blockpay_handle_error($invoice)) {
+    $record['btc_price'] = $invoice['btcPrice'];
+    $record['status'] = $invoice['status'];
+    blockpay_write_record($record, $invoice_id);
+  }
+  return $invoice;
+}
+
+/**
+ * Gets BlockPay invoice payment info.
+ *
+ * @param $invoice_id
+ *   A string containing the BlockPay invoice ID.
+ *
+ * @return array
+ *   - id: The invoice ID (string).
+ *   - alert: 1 if the invoice was overpaid, -1 if the invoice was underpaid.
+ *   - btc_paid: The amount paid in BTC (string).
+ */
+function blockpay_get_payment($invoice_id) {
+  // There is apparently no API to get payment info, so we screen scrape.
+  $curl = curl_init();
+  $curl_options = array(
+    CURLOPT_URL => url('https://blockpay.net/invoice', array('query' => array('id' => $invoice_id))),
+    CURLOPT_FOLLOWLOCATION => TRUE,
+    CURLOPT_RETURNTRANSFER => TRUE,
+    CURLOPT_SSL_VERIFYPEER => TRUE,
+    CURLOPT_SSL_VERIFYHOST => TRUE,
+  );
+  curl_setopt_array($curl, $curl_options);
+  $content = curl_exec($curl);
+  $invoice = array('invoice_id' => $invoice_id, 'alert' => NULL, 'btc_paid' => NULL);
+  if (!$content) {
+    watchdog('blockpay', 'Error while requesting invoice payment status from BlockPay.', WATCHDOG_ERROR);
+  }
+  else {
+    if (preg_match('/Paid: ([0-9.]+) BTC/', $content, $matches)) {
+      $invoice['btc_paid'] = $matches[1];
+      $invoice['alert'] = 0;
+    }
+    if (substr_count($content, 'This invoice has been overpaid.') > 1) {
+      $invoice['alert'] = 1;
+    }
+    if (substr_count($content, 'This invoice expired before it was fully paid.') > 1) {
+      $invoice['alert'] = -1;
+    }
+    blockpay_write_record($invoice, $invoice_id);
+  }
+  return $invoice;
+}
+
+/**
+ * Helper function to handle errors. Returns FALSE on error.
+ */
+function blockpay_handle_error($response) {
+  if (variable_get('blockpay_debug', FALSE)) {
+    watchdog('debug', 'Receiving BlockPay API response: %response.', array('%response' => print_r($response, TRUE)), WATCHDOG_DEBUG);
+  }
+  $errors = array();
+  if (is_string($response)) {
+    $errors[] = array('type' => 'unknown', 'message' => $response);
+  }
+  elseif (isset($response['error']) && is_string($response['error'])) {
+    $errors[] = array('type' => 'bpCurl', 'message' => $response['error']);
+  }
+  elseif (isset($response['error']) && is_array($response['error'])) {
+    if (empty($response['error']['messages'])) {
+      $errors[] = array('type' => $response['error']['type'], 'message' => $response['error']['message']);
+    }
+    else {
+      foreach ($response['error']['messages'] as $field => $message) {
+        $errors[] = array('type' => $response['error']['type'], 'message' => "{$response['error']['message']} ($field $message).");
+      }
+    }
+  }
+  if ($errors) {
+    foreach ($errors as $error) {
+      watchdog('blockpay', 'BlockPay error (type: %type): %message.', array('%type' => $error['type'], '%message' => $error['message']), WATCHDOG_ERROR);
+    }
+    return FALSE;
+  }
+  return $response;
+}
+
+/**
+ * Helper function to load BlockPay default settings.
+ */
+function blockpay_initialize() {
+  global $bpOptions;
+  static $initialized;
+  if (!$initialized) {
+    module_load_include('php', 'blockpay', 'php-client/bp_lib');
+    $bpOptions['apiKey'] = variable_get('blockpay_api_key', '');
+    $bpOptions['verifyPos'] = TRUE;
+    $bpOptions['notificationEmail'] = variable_get('blockpay_notification_email', variable_get('site_mail', ini_get('sendmail_from')));
+    $bpOptions['notificationURL'] = url('blockpay/callback', array('absolute' => TRUE, 'https' => TRUE));
+    $bpOptions['redirectURL'] = url(variable_get('blockpay_redirect_url', ''), array('absolute' => TRUE));
+    $bpOptions['currency'] = variable_get('blockpay_currency', 'BTC');
+    $bpOptions['physical'] = (bool) variable_get('blockpay_physical', TRUE);
+    $bpOptions['fullNotifications'] = FALSE;
+    $bpOptions['transactionSpeed'] = variable_get('blockpay_transaction_speed', 'low');
+    $initialized = TRUE;
+  }
+}
+
+/**
+ * Returns a renderable array for the BlockPay invoice iframe.
+ */
+function blockpay_invoice_iframe($invoice_id) {
+  $element['#type'] = 'html_tag';
+  $element['#tag'] = 'iframe';
+  $element['#attributes']['class'] = 'blockpay-invoice';
+  $element['#attributes']['src'] = blockpay_invoice_url($invoice_id, 'iframe');
+  $element['#value'] = '';
+  return $element;
+}
+
+/**
+ * Generates BlockPay invoice URL.
+ */
+function blockpay_invoice_url($invoice_id, $view = '') {
+  return url('https://blockpay.net/invoice', array('query' => array('id' => $invoice_id, 'view' => $view)));
+}
+
+/**
+ * Implements hook_menu().
+ */
+function blockpay_menu() {
+  $items['admin/config/services/blockpay'] = array(
+    'title' => 'BlockPay',
+    'description' => 'Configure the BlockPay settings.',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('blockpay_settings'),
+    'access arguments' => array('administer site configuration'),
+    'file' => 'blockpay.admin.inc',
+  );
+  $items['blockpay/callback'] = array(
+    'title' => 'BlockPay callback',
+    'description' => 'Handles BlockPay invoice status updates.',
+    'page callback' => 'blockpay_callback',
+    'access callback' => TRUE,
+    'file' => 'blockpay.pages.inc',
+  );
+  return $items;
+}
+
+/**
+ * Implements hook_theme().
+ */
+function blockpay_theme($existing, $type, $theme, $path) {
+  return array(
+    'blockpay_invoice_iframe' => array(
+      'variables' => array(
+        'iframe' => NULL,
+        'invoice_id' => NULL,
+      ),
+      'template' => 'blockpay-invoice-iframe',
+    ),
+  );
+}
+
+/**
+ * Stores a record of the BlockPay invoice in the local database.
+ */
+function blockpay_write_record($invoice, $invoice_id) {
+  $invoice['changed'] = REQUEST_TIME;
+  db_merge('blockpay')
+    ->key(array('invoice_id' => $invoice_id))
+    ->fields($invoice)
+    ->execute();
+}
+
+/**
+ * Preprocess variables for blockpay-invoice-iframe.tpl.php
+ */
+function template_preprocess_blockpay_invoice_iframe(&$variables) {
+  $variables['iframe'] = blockpay_invoice_iframe($variables['invoice_id']);
+}
