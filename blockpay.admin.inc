@@ -7,7 +7,7 @@ function blockpay_settings() {
   $form['blockpay_api_key'] = array(
     '#type' => 'textfield',
     '#title' => t('BlockPay API key'),
-    '#description' => t('The API key you created at <a href="https://blockpay.net/api-keys">blockpay.net</a>.'),
+    '#description' => t('The API key you created at <a href="https://blockpay.net">blockpay.net</a>.'),
     '#default_value' => variable_get('blockpay_api_key', ''),
     '#required' => TRUE,
   );
